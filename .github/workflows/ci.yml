@@ -1,0 +1,20 @@
+name: Repo Integrity
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install C compiler
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Verify PKGBUILD, patches, driver sync, and userspace test compilation
+        run: ./scripts/verify-repo.sh

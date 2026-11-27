@@ -1,0 +1,2 @@
+# Allow unprivileged members of the jarvis group to access /dev/jarvis
+KERNEL=="jarvis", SUBSYSTEM=="misc", GROUP="jarvis", MODE="0660"

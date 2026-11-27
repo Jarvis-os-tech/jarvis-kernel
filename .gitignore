@@ -1,0 +1,29 @@
+# Build and packaging outputs
+src/
+pkg/
+out/
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.pkg.tar.*
+*.sig
+
+# Compiled kernel & userspace test artifacts
+*.o
+*.a
+*.ko
+*.mod
+*.mod.c
+*.order
+*.cmd
+*.raw
+*.img
+*.cpio
+*.cpio.gz
+*.log
+.config.old
+Module.symvers
+System.map
+vmlinux
+vmlinux.unstripped
+jarvis-kernel-check

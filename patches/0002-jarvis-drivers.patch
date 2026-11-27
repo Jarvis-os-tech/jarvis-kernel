@@ -1,0 +1,2554 @@
+diff --git a/drivers/Kconfig b/drivers/Kconfig
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -45,6 +45,8 @@ source "drivers/nvme/Kconfig"
+ 
+ source "drivers/misc/Kconfig"
+ 
++source "drivers/jarvis/Kconfig"
++
+ source "drivers/scsi/Kconfig"
+ 
+ source "drivers/ata/Kconfig"
+diff --git a/drivers/Makefile b/drivers/Makefile
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -197,4 +197,5 @@ obj-$(CONFIG_DPLL)		+= dpll/
+ obj-y				+= resctrl/
+ 
+ obj-$(CONFIG_DIBS)		+= dibs/
++obj-$(CONFIG_JARVIS)		+= jarvis/
+ obj-$(CONFIG_S390)		+= s390/
+diff --git a/drivers/jarvis/Kconfig b/drivers/jarvis/Kconfig
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/Kconfig
+@@ -0,0 +1,107 @@
++# SPDX-License-Identifier: GPL-2.0
++
++# linux-jarvisos: AI-integrated Linux kernel
++# All JARVIS sub-options depend on the core JARVIS driver.
++
++config JARVIS
++	tristate "JARVIS AI kernel integration driver"
++	help
++	  Core driver for linux-jarvisos.  Exposes /dev/jarvis as a misc
++	  character device providing a ring-buffered query/response channel
++	  between the kernel and the Project-JARVIS AI assistant daemon.
++
++	  Kernel subsystems (thermal, OOM, audit, …) can call
++	  jarvis_post_query() to send natural-language events directly to
++	  the AI without leaving kernel context.  The daemon polls /dev/jarvis,
++	  runs inference (local Ollama or cloud API), and replies via ioctl.
++
++	  Enable all sub-options below for full AI–OS integration.
++
++	  If unsure, say M.
++
++config JARVIS_DIBS
++	bool "JARVIS zero-copy DIBS shared-memory integration"
++	depends on JARVIS
++	depends on DIBS
++	default y
++	help
++	  Register the JARVIS driver as a DIBS (Direct Internal Buffer Sharing)
++	  client.  The AI daemon can pre-register DMBs (Direct Memory Buffers)
++	  so large inference payloads are transferred zero-copy between kernel
++	  and userspace — critical for on-device LLM inference throughput.
++
++	  Requires CONFIG_DIBS=y or =m.  If DIBS is a module, JARVIS must
++	  also be a module.
++
++	  If unsure, say Y.
++
++config JARVIS_SYSMON
++	bool "JARVIS system monitor — hardware metrics for model selection"
++	depends on JARVIS
++	default y
++	help
++	  Provides real-time CPU, memory, and thermal metrics via:
++	    - JARVIS_IOC_SYSMON ioctl (struct jarvis_sysmon snapshot)
++	    - /sys/class/misc/jarvis/sysmon/{cpu_load,mem_avail,thermal,…}
++
++	  The JARVIS daemon uses these to decide:
++	    - Whether to run Ollama locally or fall back to a cloud API
++	    - Which Ollama model fits the available VRAM / RAM
++	    - Whether to throttle inference under thermal pressure
++
++	  Replaces the older CONFIG_JARVIS_SYSFS_METRICS option.
++
++	  If unsure, say Y.
++
++# Legacy alias so old .config files still work
++config JARVIS_SYSFS_METRICS
++	bool
++	depends on JARVIS
++	select JARVIS_SYSMON
++
++config JARVIS_POLICY
++	bool "JARVIS AI action security policy engine"
++	depends on JARVIS
++	default y
++	help
++	  Tiered security policy for every MCP tool call the AI dispatches:
++
++	    SAFE      — silent execution
++	    ELEVATED  — execution + kernel audit log entry
++	    DANGEROUS — blocked until the user confirms (kernel posts a
++	                JARVIS_QTYPE_POLICY_REQ query to the daemon)
++	    FORBIDDEN — unconditionally blocked
++
++	  The policy table ships with sane defaults (ShellMCP → DANGEROUS,
++	  FileSystemMCP reads → SAFE, writes → ELEVATED, deletes → DANGEROUS)
++	  and is tunable at runtime via JARVIS_IOC_POLICY_* ioctls or the
++	  /sys/class/misc/jarvis/policy/policy_table sysfs file.
++
++	  Per-rule rate limiting is also enforced here.
++
++	  Disabling this makes the AI fully permissive — not recommended for
++	  production systems.
++
++	  If unsure, say Y.
++
++config JARVIS_KEYS
++	bool "JARVIS secure API-key storage via kernel keyring"
++	depends on JARVIS
++	depends on KEYS
++	default y
++	help
++	  Stores LLM provider API keys (Claude, OpenAI, OpenRouter, …) in a
++	  dedicated "_jarvis" kernel keyring so they never touch disk or
++	  environment variables.
++
++	  At boot an admin (or the jarvis-keyctl helper) writes keys via
++	  JARVIS_IOC_KEY_STORE; the JARVIS daemon retrieves them via
++	  JARVIS_IOC_KEY_GET at startup and passes them to the LLM provider.
++
++	  The jarvis_key_lookup() function is also exported for other kernel
++	  modules that need authenticated access to AI infrastructure (e.g. a
++	  future kernel-level HTTPS transport).
++
++	  Requires CONFIG_KEYS=y.
++
++	  If unsure, say Y.
+diff --git a/drivers/jarvis/Makefile b/drivers/jarvis/Makefile
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/Makefile
+@@ -0,0 +1,15 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# linux-jarvisos — JARVIS AI kernel integration driver
++#
++
++obj-$(CONFIG_JARVIS)		+= jarvis.o
++
++# Always-on core
++jarvis-y			+= jarvis_core.o
++
++# Optional sub-modules compiled into the same jarvis.ko
++jarvis-$(CONFIG_JARVIS_DIBS)	+= jarvis_dibs.o
++jarvis-$(CONFIG_JARVIS_SYSMON)	+= jarvis_sysmon.o
++jarvis-$(CONFIG_JARVIS_POLICY)	+= jarvis_policy.o
++jarvis-$(CONFIG_JARVIS_KEYS)	+= jarvis_keys.o
+diff --git a/drivers/jarvis/jarvis_core.c b/drivers/jarvis/jarvis_core.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_core.c
+@@ -0,0 +1,620 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * JARVIS AI Kernel Integration Driver - Core
++ *
++ * Exposes /dev/jarvis as a misc character device.  Kernel subsystems enqueue
++ * structured queries via jarvis_post_query(); the AI daemon reads them with
++ * read(), posts responses with JARVIS_IOC_RESPOND, and polls for new work
++ * with poll()/select().
++ *
++ * Ring buffer layout
++ * ------------------
++ * We maintain two KFIFO ring buffers (lockless on the hot path):
++ *   query_fifo  — kernel writers, single daemon reader
++ *   pending_ids — parallel queue of query IDs that have been read out but
++ *                 not yet answered (for response matching)
++ *
++ * Security
++ * --------
++ * Members of the jarvis group may open /dev/jarvis (O_RDWR); access is
++ * enforced by udev device ownership (GROUP=jarvis MODE=0660) so no
++ * capability is required at the VFS layer.
++ * Kernel-internal callers use jarvis_post_query() directly.
++ *
++ * Copyright (c) 2025 JARVISos Contributors
++ */
++#define pr_fmt(fmt) "jarvis: " fmt
++
++#include <linux/module.h>
++#include <linux/miscdevice.h>
++#include <linux/fs.h>
++#include <linux/poll.h>
++#include <linux/kfifo.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/atomic.h>
++#include <linux/ktime.h>
++#include <linux/uaccess.h>
++#include <linux/wait.h>
++#include <linux/sysfs.h>
++#include <linux/device.h>
++
++#include <linux/jarvis.h>
++#include <uapi/linux/jarvis.h>
++#include "jarvis_dibs.h"
++#include "jarvis_sysmon.h"
++#include "jarvis_policy.h"
++#include "jarvis_keys.h"
++
++/* Internal query slot stored in the ring buffer */
++struct jarvis_qslot {
++	struct jarvis_query q;
++};
++
++/* Response waiting for a caller blocked on jarvis_query_wait() */
++struct jarvis_pending {
++	u64 id;
++	struct completion done;
++	struct jarvis_response resp;
++	struct list_head node;
++};
++
++/* -----------------------------------------------------------------------
++ * Driver-wide state
++ * --------------------------------------------------------------------- */
++
++#define QUERY_FIFO_SIZE   32   /* max outstanding kernel→AI queries */
++
++/* One KFIFO entry = one full jarvis_qslot (copy-based, simple, safe) */
++DEFINE_KFIFO(query_fifo, struct jarvis_qslot, QUERY_FIFO_SIZE);
++
++static DECLARE_WAIT_QUEUE_HEAD(query_wq);
++static DEFINE_SPINLOCK(fifo_lock);
++
++/* AI daemon file state — at most one opener */
++static DEFINE_MUTEX(daemon_lock);
++static bool daemon_connected;
++
++/* Daemon-reported state */
++static atomic_t jarvis_state    = ATOMIC_INIT(JARVIS_STATE_OFFLINE);
++static atomic_t jarvis_provider = ATOMIC_INIT(JARVIS_PROVIDER_NONE);
++static char     jarvis_model[JARVIS_MODEL_NAME_LEN];
++static DEFINE_SPINLOCK(model_lock);
++
++/* Pending responses (kernel callers blocked waiting for AI reply) */
++static LIST_HEAD(pending_list);
++static DEFINE_SPINLOCK(pending_lock);
++
++/* Monotonically increasing query ID */
++static atomic64_t next_query_id = ATOMIC64_INIT(1);
++
++/* -----------------------------------------------------------------------
++ * Public kernel API
++ * --------------------------------------------------------------------- */
++
++/**
++ * jarvis_post_query - submit a query to the AI daemon (fire-and-forget)
++ * @type:  one of enum jarvis_query_type
++ * @data:  query payload (NUL-terminated string or binary blob)
++ * @len:   number of bytes in @data (must be ≤ JARVIS_MAX_QUERY_LEN)
++ *
++ * Returns 0 on success, -ENODEV if no daemon is connected, -ENOSPC if the
++ * ring buffer is full, -EINVAL on bad arguments.
++ *
++ * Safe to call from interrupt context (uses spin_lock_irqsave internally).
++ */
++int jarvis_post_query(enum jarvis_query_type type, const void *data, u32 len)
++{
++	struct jarvis_qslot *slot;
++	unsigned long flags;
++	int rc;
++
++	if (!data || len == 0 || len > JARVIS_MAX_QUERY_LEN)
++		return -EINVAL;
++
++	if (!READ_ONCE(daemon_connected))
++		return -ENODEV;
++
++	/* Heap-allocated: jarvis_qslot is too large (~4 KiB) for the stack. */
++	slot = kzalloc(sizeof(*slot), GFP_ATOMIC);
++	if (!slot)
++		return -ENOMEM;
++
++	slot->q.id        = atomic64_fetch_add(1, &next_query_id);
++	slot->q.type      = type;
++	slot->q.len       = len;
++	slot->q.timestamp = ktime_get_ns();
++	memcpy(slot->q.data, data, len);
++
++	spin_lock_irqsave(&fifo_lock, flags);
++	rc = kfifo_in(&query_fifo, slot, 1) ? 0 : -ENOSPC;
++	spin_unlock_irqrestore(&fifo_lock, flags);
++
++	if (!rc)
++		wake_up_interruptible(&query_wq);
++
++	kfree(slot);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(jarvis_post_query);
++
++/**
++ * jarvis_query_sync - submit a query and block until the AI replies
++ * @type:    query type
++ * @data:    payload
++ * @len:     payload length
++ * @resp:    output — filled with the AI response on success
++ * @timeout: wait timeout in jiffies (0 = wait forever)
++ *
++ * Returns 0 on success, -ETIME on timeout, or a negative error code.
++ * Must NOT be called from interrupt context.
++ */
++int jarvis_query_sync(enum jarvis_query_type type, const void *data, u32 len,
++		      struct jarvis_response *resp, unsigned long timeout)
++{
++	struct jarvis_pending *pend;
++	struct jarvis_qslot *slot;
++	unsigned long flags;
++	long rem;
++	int rc;
++
++	if (!data || len == 0 || len > JARVIS_MAX_QUERY_LEN || !resp)
++		return -EINVAL;
++
++	if (!READ_ONCE(daemon_connected))
++		return -ENODEV;
++
++	pend = kzalloc(sizeof(*pend), GFP_KERNEL);
++	if (!pend)
++		return -ENOMEM;
++
++	/* Heap-allocated: jarvis_qslot is too large (~4 KiB) for the stack. */
++	slot = kzalloc(sizeof(*slot), GFP_KERNEL);
++	if (!slot) {
++		kfree(pend);
++		return -ENOMEM;
++	}
++
++	init_completion(&pend->done);
++	pend->id = atomic64_fetch_add(1, &next_query_id);
++
++	slot->q.id        = pend->id;
++	slot->q.type      = type;
++	slot->q.len       = len;
++	slot->q.timestamp = ktime_get_ns();
++	memcpy(slot->q.data, data, len);
++
++	spin_lock_irqsave(&pending_lock, flags);
++	list_add_tail(&pend->node, &pending_list);
++	spin_unlock_irqrestore(&pending_lock, flags);
++
++	spin_lock_irqsave(&fifo_lock, flags);
++	rc = kfifo_in(&query_fifo, slot, 1) ? 0 : -ENOSPC;
++	spin_unlock_irqrestore(&fifo_lock, flags);
++	kfree(slot);
++
++	if (rc) {
++		spin_lock_irqsave(&pending_lock, flags);
++		list_del(&pend->node);
++		spin_unlock_irqrestore(&pending_lock, flags);
++		kfree(pend);
++		return rc;
++	}
++
++	wake_up_interruptible(&query_wq);
++
++	if (timeout)
++		rem = wait_for_completion_interruptible_timeout(&pend->done, timeout);
++	else
++		rem = wait_for_completion_interruptible(&pend->done);
++
++	if (rem < 0) {
++		rc = rem; /* -ERESTARTSYS */
++	} else if (rem == 0 && timeout) {
++		rc = -ETIME;
++	} else {
++		*resp = pend->resp;
++		rc = 0;
++	}
++
++	/* If timed out/interrupted, remove from pending list */
++	if (rc) {
++		spin_lock_irqsave(&pending_lock, flags);
++		list_del(&pend->node);
++		spin_unlock_irqrestore(&pending_lock, flags);
++	}
++
++	kfree(pend);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(jarvis_query_sync);
++
++/* -----------------------------------------------------------------------
++ * File operations
++ * --------------------------------------------------------------------- */
++
++static int jarvis_open(struct inode *inode, struct file *filp)
++{
++	mutex_lock(&daemon_lock);
++	if (daemon_connected) {
++		mutex_unlock(&daemon_lock);
++		return -EBUSY; /* Only one daemon at a time */
++	}
++	daemon_connected = true;
++	atomic_set(&jarvis_state, JARVIS_STATE_IDLE);
++	mutex_unlock(&daemon_lock);
++
++	pr_info("AI daemon connected\n");
++	return 0;
++}
++
++static int jarvis_release(struct inode *inode, struct file *filp)
++{
++	struct jarvis_pending *pend, *tmp;
++	unsigned long flags;
++
++	mutex_lock(&daemon_lock);
++	daemon_connected = false;
++	atomic_set(&jarvis_state, JARVIS_STATE_OFFLINE);
++	mutex_unlock(&daemon_lock);
++
++	/* Wake any kernel callers blocked in jarvis_query_sync() */
++	spin_lock_irqsave(&pending_lock, flags);
++	list_for_each_entry_safe(pend, tmp, &pending_list, node) {
++		list_del(&pend->node);
++		pend->resp.status = UINT_MAX; /* error sentinel */
++		complete(&pend->done);
++	}
++	spin_unlock_irqrestore(&pending_lock, flags);
++
++	pr_info("AI daemon disconnected\n");
++	return 0;
++}
++
++/*
++ * read() — the daemon pulls one query at a time.
++ * Blocks until a query is available (or O_NONBLOCK returns -EAGAIN).
++ */
++static ssize_t jarvis_read(struct file *filp, char __user *ubuf,
++			   size_t count, loff_t *pos)
++{
++	struct jarvis_qslot *slot;
++	unsigned long flags;
++	unsigned int copied;
++	ssize_t ret;
++
++	if (count < sizeof(slot->q))
++		return -EINVAL;
++
++	/* Block until data available (or interrupted) */
++	ret = wait_event_interruptible(query_wq,
++		({ spin_lock_irqsave(&fifo_lock, flags);
++		   bool have = !kfifo_is_empty(&query_fifo);
++		   spin_unlock_irqrestore(&fifo_lock, flags);
++		   have; }) || (filp->f_flags & O_NONBLOCK));
++
++	if (ret)
++		return ret;
++
++	/* Heap-allocated: jarvis_qslot is too large (~4 KiB) for the stack. */
++	slot = kmalloc(sizeof(*slot), GFP_KERNEL);
++	if (!slot)
++		return -ENOMEM;
++
++	spin_lock_irqsave(&fifo_lock, flags);
++	copied = kfifo_get(&query_fifo, slot);
++	spin_unlock_irqrestore(&fifo_lock, flags);
++
++	if (!copied)
++		ret = (filp->f_flags & O_NONBLOCK) ? -EAGAIN : -EIO;
++	else if (copy_to_user(ubuf, &slot->q, sizeof(slot->q)))
++		ret = -EFAULT;
++	else
++		ret = sizeof(slot->q);
++
++	kfree(slot);
++	return ret;
++}
++
++static __poll_t jarvis_poll(struct file *filp, poll_table *wait)
++{
++	unsigned long flags;
++	bool have_data;
++
++	poll_wait(filp, &query_wq, wait);
++
++	spin_lock_irqsave(&fifo_lock, flags);
++	have_data = !kfifo_is_empty(&query_fifo);
++	spin_unlock_irqrestore(&fifo_lock, flags);
++
++	return have_data ? (EPOLLIN | EPOLLRDNORM) : 0;
++}
++
++static long jarvis_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++	void __user *uarg = (void __user *)arg;
++	unsigned long flags;
++	int rc = 0;
++
++	switch (cmd) {
++
++	case JARVIS_IOC_STATUS: {
++		struct jarvis_status st = {};
++		st.state    = atomic_read(&jarvis_state);
++		st.provider = atomic_read(&jarvis_provider);
++		spin_lock_irqsave(&fifo_lock, flags);
++		st.pending_queries = kfifo_len(&query_fifo);
++		spin_unlock_irqrestore(&fifo_lock, flags);
++		spin_lock_irqsave(&model_lock, flags);
++		strscpy(st.model_name, jarvis_model, sizeof(st.model_name));
++		st.model_loaded = (jarvis_model[0] != '\0') ? 1 : 0;
++		spin_unlock_irqrestore(&model_lock, flags);
++		if (copy_to_user(uarg, &st, sizeof(st)))
++			return -EFAULT;
++		break;
++	}
++
++	case JARVIS_IOC_SET_STATE: {
++		__u32 state;
++		if (copy_from_user(&state, uarg, sizeof(state)))
++			return -EFAULT;
++		if (state > JARVIS_STATE_ERROR)
++			return -EINVAL;
++		atomic_set(&jarvis_state, state);
++		pr_debug("daemon state → %u\n", state);
++		break;
++	}
++
++	case JARVIS_IOC_SET_MODEL: {
++		char name[JARVIS_MODEL_NAME_LEN] = {};
++		if (copy_from_user(name, uarg, sizeof(name) - 1))
++			return -EFAULT;
++		spin_lock_irqsave(&model_lock, flags);
++		strscpy(jarvis_model, name, sizeof(jarvis_model));
++		spin_unlock_irqrestore(&model_lock, flags);
++		pr_info("AI model: %s\n", jarvis_model);
++		break;
++	}
++
++	case JARVIS_IOC_RESPOND: {
++		struct jarvis_respond_ioc ioc;
++		struct jarvis_response *resp;
++		struct jarvis_pending *pend;
++		bool found = false;
++
++		if (copy_from_user(&ioc, uarg, sizeof(ioc)))
++			return -EFAULT;
++		if (ioc.len > JARVIS_MAX_RESP_LEN)
++			return -EINVAL;
++
++		resp = kzalloc(sizeof(*resp), GFP_KERNEL);
++		if (!resp)
++			return -ENOMEM;
++
++		resp->id     = ioc.id;
++		resp->status = ioc.status;
++		resp->flags  = ioc.flags;
++		resp->len    = ioc.len;
++
++		if (ioc.len && copy_from_user(resp->data,
++					      (void __user *)(uintptr_t)ioc.data_ptr,
++					      ioc.len)) {
++			kfree(resp);
++			return -EFAULT;
++		}
++
++		spin_lock_irqsave(&pending_lock, flags);
++		list_for_each_entry(pend, &pending_list, node) {
++			if (pend->id == resp->id) {
++				pend->resp = *resp;
++				list_del(&pend->node);
++				complete(&pend->done);
++				found = true;
++				break;
++			}
++		}
++		spin_unlock_irqrestore(&pending_lock, flags);
++
++		if (!found)
++			pr_debug("response for unknown query id %llu\n",
++				 (unsigned long long)resp->id);
++		kfree(resp);
++		break;
++	}
++
++	case JARVIS_IOC_FLUSH: {
++		spin_lock_irqsave(&fifo_lock, flags);
++		kfifo_reset(&query_fifo);
++		spin_unlock_irqrestore(&fifo_lock, flags);
++		pr_info("query queue flushed\n");
++		break;
++	}
++
++	case JARVIS_IOC_SET_PROVIDER: {
++		__u32 provider;
++		if (copy_from_user(&provider, uarg, sizeof(provider)))
++			return -EFAULT;
++		if (provider > JARVIS_PROVIDER_OPENAI_COMPAT)
++			return -EINVAL;
++		/* stored alongside state for sysfs/status reporting */
++		atomic_set(&jarvis_provider, provider);
++		pr_debug("LLM provider → %u\n", provider);
++		break;
++	}
++
++	/* Sysmon ioctl */
++	case JARVIS_IOC_SYSMON: {
++		struct jarvis_sysmon sm;
++		jarvis_sysmon_sample(&sm);
++		if (copy_to_user(uarg, &sm, sizeof(sm)))
++			return -EFAULT;
++		break;
++	}
++
++	/* Policy ioctls */
++	case JARVIS_IOC_POLICY_ADD:
++	case JARVIS_IOC_POLICY_DEL:
++	case JARVIS_IOC_POLICY_CHECK:
++	case JARVIS_IOC_POLICY_RESET:
++		rc = jarvis_policy_ioctl(cmd, uarg);
++		break;
++
++	/* Key ioctls */
++	case JARVIS_IOC_KEY_STORE:
++	case JARVIS_IOC_KEY_GET:
++	case JARVIS_IOC_KEY_DEL:
++		rc = jarvis_keys_ioctl(cmd, uarg);
++		break;
++
++	/* DIBS ioctls */
++	case JARVIS_IOC_DIBS_REG:
++	case JARVIS_IOC_DIBS_UNREG:
++		rc = jarvis_dibs_ioctl(cmd, uarg);
++		break;
++
++	default:
++		return -ENOTTY;
++	}
++
++	return rc;
++}
++
++/* -----------------------------------------------------------------------
++ * sysfs attributes
++ * --------------------------------------------------------------------- */
++#if defined(CONFIG_JARVIS_SYSFS_METRICS) || defined(CONFIG_JARVIS_SYSMON)
++
++static ssize_t state_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	static const char * const names[] = {
++		[JARVIS_STATE_OFFLINE]    = "offline",
++		[JARVIS_STATE_IDLE]       = "idle",
++		[JARVIS_STATE_PROCESSING] = "processing",
++		[JARVIS_STATE_ERROR]      = "error",
++	};
++	unsigned int s = atomic_read(&jarvis_state);
++	if (s >= ARRAY_SIZE(names) || !names[s])
++		return sysfs_emit(buf, "unknown\n");
++	return sysfs_emit(buf, "%s\n", names[s]);
++}
++static DEVICE_ATTR_RO(state);
++
++static ssize_t model_show(struct device *dev, struct device_attribute *attr,
++			  char *buf)
++{
++	unsigned long flags;
++	char name[JARVIS_MODEL_NAME_LEN];
++
++	spin_lock_irqsave(&model_lock, flags);
++	strscpy(name, jarvis_model, sizeof(name));
++	spin_unlock_irqrestore(&model_lock, flags);
++
++	return sysfs_emit(buf, "%s\n", name[0] ? name : "(none)");
++}
++static DEVICE_ATTR_RO(model);
++
++static ssize_t pending_show(struct device *dev, struct device_attribute *attr,
++			    char *buf)
++{
++	unsigned long flags;
++	unsigned int n;
++
++	spin_lock_irqsave(&fifo_lock, flags);
++	n = kfifo_len(&query_fifo);
++	spin_unlock_irqrestore(&fifo_lock, flags);
++
++	return sysfs_emit(buf, "%u\n", n);
++}
++static DEVICE_ATTR_RO(pending);
++
++static struct attribute *jarvis_dev_attrs[] = {
++	&dev_attr_state.attr,
++	&dev_attr_model.attr,
++	&dev_attr_pending.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(jarvis_dev);
++
++#endif /* CONFIG_JARVIS_SYSFS_METRICS || CONFIG_JARVIS_SYSMON */
++
++/* -----------------------------------------------------------------------
++ * Misc device registration
++ * --------------------------------------------------------------------- */
++
++static const struct file_operations jarvis_fops = {
++	.owner          = THIS_MODULE,
++	.open           = jarvis_open,
++	.release        = jarvis_release,
++	.read           = jarvis_read,
++	.poll           = jarvis_poll,
++	.unlocked_ioctl = jarvis_ioctl,
++	.compat_ioctl   = jarvis_ioctl,
++};
++
++static struct miscdevice jarvis_misc = {
++	.minor  = MISC_DYNAMIC_MINOR,
++	.name   = "jarvis",
++	.fops   = &jarvis_fops,
++	.mode   = 0600,
++#if defined(CONFIG_JARVIS_SYSFS_METRICS) || defined(CONFIG_JARVIS_SYSMON)
++	.groups = jarvis_dev_groups,
++#endif
++};
++
++/* -----------------------------------------------------------------------
++ * Module init / exit
++ * --------------------------------------------------------------------- */
++
++static int __init jarvis_init(void)
++{
++	int rc;
++
++	/* 1. Register the misc device first (creates sysfs node) */
++	rc = misc_register(&jarvis_misc);
++	if (rc) {
++		pr_err("failed to register misc device: %d\n", rc);
++		return rc;
++	}
++
++	/* 2. Security policy engine (must be up before any dispatch) */
++	rc = jarvis_policy_init(jarvis_misc.this_device);
++	if (rc)
++		pr_warn("policy init failed (%d) — running permissive\n", rc);
++
++	/* 3. Secure key storage */
++	rc = jarvis_keys_init();
++	if (rc)
++		pr_warn("keys init failed (%d) — API keys must be env-based\n", rc);
++
++	/* 4. System monitor */
++	rc = jarvis_sysmon_init(jarvis_misc.this_device);
++	if (rc)
++		pr_warn("sysmon init failed (%d) — hardware metrics unavailable\n", rc);
++
++	/* 5. DIBS zero-copy buffers (non-fatal) */
++	rc = jarvis_dibs_init();
++	if (rc)
++		pr_info("DIBS init failed (%d) — zero-copy path disabled\n", rc);
++
++	pr_info("linux-jarvisos: JARVIS AI integration driver loaded (/dev/jarvis)\n");
++	return 0;
++}
++
++static void __exit jarvis_exit(void)
++{
++	jarvis_dibs_exit();
++	jarvis_sysmon_exit(jarvis_misc.this_device);
++	jarvis_policy_exit(jarvis_misc.this_device);
++	jarvis_keys_exit();
++	misc_deregister(&jarvis_misc);
++	pr_info("JARVIS driver unloaded\n");
++}
++
++module_init(jarvis_init);
++module_exit(jarvis_exit);
++
++MODULE_AUTHOR("JARVISos Contributors");
++MODULE_DESCRIPTION("JARVIS AI kernel integration driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/jarvis/jarvis_dibs.c b/drivers/jarvis/jarvis_dibs.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_dibs.c
+@@ -0,0 +1,208 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * JARVIS AI Kernel Integration Driver - DIBS client
++ *
++ * Registers JARVIS as a DIBS (Direct Internal Buffer Sharing) client so the
++ * AI daemon can register pre-allocated DMBs (Direct Memory Buffers) for
++ * zero-copy transfer of large inference payloads.
++ *
++ * Usage model
++ * -----------
++ * 1. The AI daemon registers a DMB via JARVIS_IOC_DIBS_REG, providing its
++ *    DIBS token and buffer length.  The driver stores it in a slot table and
++ *    returns the slot index.
++ *
++ * 2. When a kernel caller wants to supply a large blob to the AI it can call
++ *    jarvis_dibs_write_slot(slot, data, len) to DMA the data directly into
++ *    the pre-registered DMB buffer, avoiding a user-copy.
++ *
++ * 3. The daemon reads from the DMB via its own memory-mapped view and signals
++ *    completion back through the normal JARVIS_IOC_RESPOND path.
++ *
++ * Copyright (c) 2025 JARVISos Contributors
++ */
++#define pr_fmt(fmt) "jarvis-dibs: " fmt
++
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/dibs.h>
++#include <linux/uaccess.h>
++
++#include <uapi/linux/jarvis.h>
++#include "jarvis_dibs.h"
++
++#define JARVIS_DIBS_MAX_SLOTS   8
++
++struct jarvis_dmb_slot {
++	bool             used;
++	struct dibs_dmb  dmb;
++};
++
++static struct jarvis_dmb_slot slots[JARVIS_DIBS_MAX_SLOTS];
++static DEFINE_SPINLOCK(slots_lock);
++
++/* -----------------------------------------------------------------------
++ * DIBS client callbacks
++ * --------------------------------------------------------------------- */
++
++static void jarvis_dibs_add_dev(struct dibs_dev *dibs)
++{
++	pr_debug("DIBS device added: fabric 0x%04x\n",
++		 dibs->ops->get_fabric_id(dibs));
++}
++
++static void jarvis_dibs_del_dev(struct dibs_dev *dibs)
++{
++	pr_debug("DIBS device removed\n");
++}
++
++static const struct dibs_client_ops jarvis_dibs_ops = {
++	.add_dev = jarvis_dibs_add_dev,
++	.del_dev = jarvis_dibs_del_dev,
++};
++
++static struct dibs_client jarvis_dibs_client = {
++	.name = "jarvis",
++	.ops  = &jarvis_dibs_ops,
++};
++
++/* -----------------------------------------------------------------------
++ * Slot management (called from jarvis_core.c ioctl handler)
++ * --------------------------------------------------------------------- */
++
++long jarvis_dibs_ioctl(unsigned int cmd, void __user *uarg)
++{
++	unsigned long flags;
++	int rc = 0;
++
++	switch (cmd) {
++
++	case JARVIS_IOC_DIBS_REG: {
++		struct jarvis_dibs_reg reg;
++		int slot = -1;
++
++		if (copy_from_user(&reg, uarg, sizeof(reg)))
++			return -EFAULT;
++
++		spin_lock_irqsave(&slots_lock, flags);
++		for (int i = 0; i < JARVIS_DIBS_MAX_SLOTS; i++) {
++			if (!slots[i].used) {
++				slot = i;
++				slots[i].used        = true;
++				slots[i].dmb.dmb_tok = reg.dmb_tok;
++				slots[i].dmb.dmb_len = reg.dmb_len;
++				break;
++			}
++		}
++		spin_unlock_irqrestore(&slots_lock, flags);
++
++		if (slot < 0)
++			return -ENOSPC;
++
++		reg.slot = (u32)slot;
++		if (copy_to_user(uarg, &reg, sizeof(reg))) {
++			/* Roll back slot allocation */
++			spin_lock_irqsave(&slots_lock, flags);
++			slots[slot].used = false;
++			spin_unlock_irqrestore(&slots_lock, flags);
++			return -EFAULT;
++		}
++
++		pr_debug("registered DMB tok=%llu len=%u → slot %d\n",
++			 (unsigned long long)reg.dmb_tok, reg.dmb_len, slot);
++		break;
++	}
++
++	case JARVIS_IOC_DIBS_UNREG: {
++		__u32 slot;
++
++		if (copy_from_user(&slot, uarg, sizeof(slot)))
++			return -EFAULT;
++
++		if (slot >= JARVIS_DIBS_MAX_SLOTS)
++			return -EINVAL;
++
++		spin_lock_irqsave(&slots_lock, flags);
++		if (!slots[slot].used) {
++			spin_unlock_irqrestore(&slots_lock, flags);
++			return -ENOENT;
++		}
++		memset(&slots[slot], 0, sizeof(slots[slot]));
++		spin_unlock_irqrestore(&slots_lock, flags);
++
++		pr_debug("unregistered slot %u\n", slot);
++		break;
++	}
++
++	default:
++		rc = -ENOTTY;
++	}
++
++	return rc;
++}
++
++/**
++ * jarvis_dibs_write_slot - copy data into a pre-registered DMB (zero-copy path)
++ * @slot:  slot index returned by JARVIS_IOC_DIBS_REG
++ * @data:  source kernel buffer
++ * @len:   bytes to copy (must be ≤ slot dmb_len)
++ *
++ * Returns 0 on success, negative error code on failure.
++ * Can be called from any context that may sleep (uses GFP_KERNEL internally).
++ */
++int jarvis_dibs_write_slot(unsigned int slot, const void *data, u32 len)
++{
++	unsigned long flags;
++	void *cpu_addr;
++	u32 dmb_len;
++
++	if (slot >= JARVIS_DIBS_MAX_SLOTS || !data || len == 0)
++		return -EINVAL;
++
++	spin_lock_irqsave(&slots_lock, flags);
++	if (!slots[slot].used) {
++		spin_unlock_irqrestore(&slots_lock, flags);
++		return -ENOENT;
++	}
++	cpu_addr = slots[slot].dmb.cpu_addr;
++	dmb_len  = slots[slot].dmb.dmb_len;
++	spin_unlock_irqrestore(&slots_lock, flags);
++
++	if (!cpu_addr)
++		return -ENXIO;  /* buffer not yet physically mapped */
++
++	if (len > dmb_len)
++		return -ENOSPC;
++
++	memcpy(cpu_addr, data, len);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(jarvis_dibs_write_slot);
++
++/* -----------------------------------------------------------------------
++ * Init / exit
++ * --------------------------------------------------------------------- */
++
++int jarvis_dibs_init(void)
++{
++	int rc;
++
++	memset(slots, 0, sizeof(slots));
++
++	rc = dibs_register_client(&jarvis_dibs_client);
++	if (rc) {
++		pr_err("failed to register as DIBS client: %d\n", rc);
++		return rc;
++	}
++
++	pr_info("registered as DIBS client (max %d slots)\n",
++		JARVIS_DIBS_MAX_SLOTS);
++	return 0;
++}
++
++void jarvis_dibs_exit(void)
++{
++	dibs_unregister_client(&jarvis_dibs_client);
++	pr_info("unregistered DIBS client\n");
++}
+diff --git a/drivers/jarvis/jarvis_dibs.h b/drivers/jarvis/jarvis_dibs.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_dibs.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * JARVIS DIBS integration — internal interface between jarvis_core and jarvis_dibs
++ */
++#ifndef _JARVIS_DIBS_H
++#define _JARVIS_DIBS_H
++
++#include <linux/types.h>
++
++#ifdef CONFIG_JARVIS_DIBS
++
++int  jarvis_dibs_init(void);
++void jarvis_dibs_exit(void);
++long jarvis_dibs_ioctl(unsigned int cmd, void __user *uarg);
++int  jarvis_dibs_write_slot(unsigned int slot, const void *data, u32 len);
++
++#else
++
++static inline int  jarvis_dibs_init(void)  { return 0; }
++static inline void jarvis_dibs_exit(void)  {}
++static inline long jarvis_dibs_ioctl(unsigned int cmd, void __user *uarg)
++{
++	return -ENOTSUPP;
++}
++static inline int  jarvis_dibs_write_slot(unsigned int slot,
++					  const void *data, u32 len)
++{
++	return -ENOTSUPP;
++}
++
++#endif /* CONFIG_JARVIS_DIBS */
++#endif /* _JARVIS_DIBS_H */
+diff --git a/drivers/jarvis/jarvis_keys.c b/drivers/jarvis/jarvis_keys.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_keys.c
+@@ -0,0 +1,248 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * JARVIS Secure Key Storage — kernel keyring integration
++ *
++ * API keys for cloud LLM providers (Claude, OpenAI, etc.) must never live in
++ * plaintext on disk or in environment variables.  This module stores them in
++ * the Linux kernel keyring and exposes them only to the JARVIS daemon.
++ *
++ * Architecture
++ * ------------
++ * At module init a dedicated "_jarvis" keyring is allocated.  Keys are
++ * "user" type (arbitrary payload) and identified by a string description
++ * such as "claude-api-key" or "openai-api-key".
++ *
++ * Key lifecycle
++ * -------------
++ *   Store : root/CAP_SYS_ADMIN writes key via JARVIS_IOC_KEY_STORE ioctl
++ *   Get   : the JARVIS daemon (CAP_SYS_ADMIN or jarvis group) reads via
++ *           JARVIS_IOC_KEY_GET ioctl
++ *   Delete: JARVIS_IOC_KEY_DEL, CAP_SYS_ADMIN only
++ *
++ * Kernel-internal consumers (e.g. a future kernel HTTPS transport for
++ * on-device inference) may call jarvis_key_lookup() directly.
++ *
++ * Security
++ * --------
++ *   - Keys are held in kernel memory only; never swapped (GFP_KERNEL | __GFP_NORETRY)
++ *   - Only CAP_SYS_ADMIN may store/delete keys
++ *   - The _jarvis keyring is not linked to any user keyring, preventing
++ *     ordinary userspace enumeration via keyctl(2)
++ *   - All access attempts are pr_info-logged for auditing
++ *
++ * Copyright (c) 2025 JARVISos Contributors
++ */
++#define pr_fmt(fmt) "jarvis-keys: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/key.h>
++#include <linux/key-type.h>
++#include <linux/keyctl.h>
++#include <linux/cred.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <keys/user-type.h>
++
++#include <uapi/linux/jarvis.h>
++#include "jarvis_keys.h"
++
++/* The private keyring that owns all JARVIS keys */
++static struct key *jarvis_keyring;
++
++/* -----------------------------------------------------------------------
++ * Kernel-internal lookup
++ * --------------------------------------------------------------------- */
++
++/**
++ * jarvis_key_lookup - retrieve a stored key value into a kernel buffer
++ * @id:     NUL-terminated key description (e.g. "claude-api-key")
++ * @buf:    destination buffer
++ * @buflen: size of @buf
++ *
++ * Returns number of bytes written, or a negative error code.
++ * Safe to call from process context.
++ */
++int jarvis_key_lookup(const char *id, char *buf, size_t buflen)
++{
++	key_ref_t key_ref;
++	struct key *key;
++	const struct user_key_payload *payload;
++	int rc;
++
++	if (!jarvis_keyring)
++		return -ENXIO;
++
++	key_ref = keyring_search(make_key_ref(jarvis_keyring, 1),
++				 &key_type_user, id, true);
++	if (IS_ERR(key_ref))
++		return PTR_ERR(key_ref);
++
++	key = key_ref_to_ptr(key_ref);
++
++	rcu_read_lock();
++	payload = user_key_payload_rcu(key);
++	if (!payload || payload->datalen == 0) {
++		rcu_read_unlock();
++		key_ref_put(key_ref);
++		return -ENODATA;
++	}
++
++	rc = min_t(size_t, payload->datalen, buflen - 1);
++	memcpy(buf, payload->data, rc);
++	buf[rc] = '\0';
++	rcu_read_unlock();
++
++	key_ref_put(key_ref);
++	return rc;
++}
++EXPORT_SYMBOL_GPL(jarvis_key_lookup);
++
++/* -----------------------------------------------------------------------
++ * ioctl handlers
++ * --------------------------------------------------------------------- */
++
++long jarvis_keys_ioctl(unsigned int cmd, void __user *uarg)
++{
++	switch (cmd) {
++
++	case JARVIS_IOC_KEY_STORE: {
++		struct jarvis_key_op op;
++		struct key *key;
++		key_ref_t ref;
++
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		if (copy_from_user(&op, uarg, sizeof(op)))
++			return -EFAULT;
++
++		op.id[sizeof(op.id) - 1]     = '\0';
++		op.data[sizeof(op.data) - 1] = '\0';
++
++		if (strnlen(op.id, sizeof(op.id)) == 0)
++			return -EINVAL;
++
++		/* Update existing key if present, else add new */
++		ref = keyring_search(make_key_ref(jarvis_keyring, 1),
++				     &key_type_user, op.id, true);
++		if (!IS_ERR(ref)) {
++			key = key_ref_to_ptr(ref);
++			key_update(ref, op.data, strnlen(op.data, sizeof(op.data)));
++			key_ref_put(ref);
++		} else {
++			key = key_alloc(&key_type_user, op.id,
++					current_fsuid(), current_fsgid(),
++					current_cred(),
++					KEY_POS_ALL | KEY_USR_ALL,
++					KEY_ALLOC_NOT_IN_QUOTA, NULL);
++			if (IS_ERR(key))
++				return PTR_ERR(key);
++
++			key_instantiate_and_link(key, op.data,
++						 strnlen(op.data, sizeof(op.data)),
++						 jarvis_keyring, NULL);
++		}
++
++		pr_info("stored key \"%s\" (%zu bytes)\n",
++			op.id, strnlen(op.data, sizeof(op.data)));
++		memzero_explicit(op.data, sizeof(op.data));
++		return 0;
++	}
++
++	case JARVIS_IOC_KEY_GET: {
++		struct jarvis_key_op op;
++		char buf[JARVIS_KEY_DATA_LEN] = {};
++		int n;
++
++		/*
++		 * Reading keys requires CAP_SYS_ADMIN.
++		 * In a full implementation this could be relaxed to members
++		 * of the 'jarvis' group via supplementary GID check.
++		 */
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		if (copy_from_user(&op, uarg, sizeof(op)))
++			return -EFAULT;
++
++		op.id[sizeof(op.id) - 1] = '\0';
++
++		n = jarvis_key_lookup(op.id, buf, sizeof(buf));
++		if (n < 0)
++			return n;
++
++		memcpy(op.data, buf, n);
++		op.len = n;
++		memzero_explicit(buf, sizeof(buf));
++
++		if (copy_to_user(uarg, &op, sizeof(op)))
++			return -EFAULT;
++
++		pr_info("retrieved key \"%s\" (%d bytes)\n", op.id, n);
++		return 0;
++	}
++
++	case JARVIS_IOC_KEY_DEL: {
++		char id[JARVIS_KEY_ID_LEN] = {};
++		struct key *key;
++		key_ref_t ref;
++
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		if (copy_from_user(id, uarg, sizeof(id) - 1))
++			return -EFAULT;
++
++		ref = keyring_search(make_key_ref(jarvis_keyring, 1),
++				     &key_type_user, id, true);
++		if (IS_ERR(ref))
++			return PTR_ERR(ref);
++
++		key = key_ref_to_ptr(ref);
++		key_unlink(jarvis_keyring, key);
++		key_ref_put(ref);
++
++		pr_info("deleted key \"%s\"\n", id);
++		return 0;
++	}
++
++	default:
++		return -ENOTTY;
++	}
++}
++
++/* -----------------------------------------------------------------------
++ * Init / exit
++ * --------------------------------------------------------------------- */
++
++int jarvis_keys_init(void)
++{
++	/*
++	 * Allocate a non-user-visible keyring.  Using KEY_ALLOC_NOT_IN_QUOTA
++	 * so key storage doesn't count against any user's quota.
++	 */
++	jarvis_keyring = keyring_alloc("_jarvis",
++				       GLOBAL_ROOT_UID, GLOBAL_ROOT_GID,
++				       current_cred(),
++				       KEY_POS_ALL | KEY_USR_ALL,
++				       KEY_ALLOC_NOT_IN_QUOTA,
++				       NULL, NULL);
++	if (IS_ERR(jarvis_keyring)) {
++		int rc = PTR_ERR(jarvis_keyring);
++		jarvis_keyring = NULL;
++		pr_err("failed to allocate _jarvis keyring: %d\n", rc);
++		return rc;
++	}
++
++	pr_info("_jarvis keyring ready (serial %d)\n",
++		key_serial(jarvis_keyring));
++	return 0;
++}
++
++void jarvis_keys_exit(void)
++{
++	if (jarvis_keyring) {
++		key_put(jarvis_keyring);
++		jarvis_keyring = NULL;
++	}
++}
+diff --git a/drivers/jarvis/jarvis_keys.h b/drivers/jarvis/jarvis_keys.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_keys.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _JARVIS_KEYS_H
++#define _JARVIS_KEYS_H
++
++#include <uapi/linux/jarvis.h>
++
++#ifdef CONFIG_JARVIS_KEYS
++
++int  jarvis_keys_init(void);
++void jarvis_keys_exit(void);
++long jarvis_keys_ioctl(unsigned int cmd, void __user *uarg);
++int  jarvis_key_lookup(const char *id, char *buf, size_t buflen);
++
++#else
++
++static inline int  jarvis_keys_init(void)  { return 0; }
++static inline void jarvis_keys_exit(void)  {}
++static inline long jarvis_keys_ioctl(unsigned int cmd, void __user *uarg)
++{
++	return -ENOTSUPP;
++}
++static inline int  jarvis_key_lookup(const char *id, char *buf, size_t buflen)
++{
++	return -ENOTSUPP;
++}
++
++#endif /* CONFIG_JARVIS_KEYS */
++#endif /* _JARVIS_KEYS_H */
+diff --git a/drivers/jarvis/jarvis_policy.c b/drivers/jarvis/jarvis_policy.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_policy.c
+@@ -0,0 +1,557 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * JARVIS AI Action Security Policy Engine
++ *
++ * Provides a tiered authorisation system for actions the AI dispatches to
++ * MCP servers.  Every time the JARVIS daemon wants to execute an action it
++ * calls JARVIS_IOC_POLICY_CHECK; the kernel consults the policy table and
++ * returns a tier + a rate-limit decision.
++ *
++ * Tier semantics
++ * --------------
++ *   SAFE      — execute silently, no confirmation, no audit entry
++ *   ELEVATED  — execute and write an audit log entry
++ *   DANGEROUS — block until the user explicitly confirms; kernel emits a
++ *               JARVIS_QTYPE_POLICY_REQ query which the daemon presents to
++ *               the user and responds to with JARVIS_IOC_RESPOND
++ *   FORBIDDEN — always blocked, never executed
++ *
++ * Policy table
++ * ------------
++ * Built-in defaults are hardcoded below and cover the known MCP servers
++ * (ShellMCP, FileSystemMCP, CodeGenMCP, etc.).  Admins can add/remove rules
++ * via JARVIS_IOC_POLICY_ADD / JARVIS_IOC_POLICY_DEL ioctls.  Rules are
++ * matched first-match-wins in insertion order, so add more specific rules
++ * before broad wildcards.
++ *
++ * Pattern format:  "server:tool"
++ *   - Either field may be "*" to match any value.
++ *   - No other glob syntax is supported (KISS).
++ *
++ * Path-based rules
++ * ----------------
++ * Each rule may carry an optional path_prefix.  When the daemon passes a
++ * non-empty @path in JARVIS_IOC_POLICY_CHECK, path-prefix rules are
++ * evaluated alongside server:tool matching.  A rule fires only when BOTH
++ * its pattern AND its path_prefix match.  An empty path_prefix matches any
++ * path (backward-compatible with existing rules).
++ *
++ * Built-in path rules block writes to sensitive system directories
++ * (/etc, /usr, /boot, /sys, /proc) unconditionally (FORBIDDEN tier).
++ * They are inserted at the head of the table so they take priority over
++ * generic server:tool rules.
++ *
++ * Rate limiting
++ * -------------
++ * Each policy entry carries an optional ratelimit_per_min value.  If > 0,
++ * the kernel enforces it with a token-bucket refilled every 60 seconds.
++ *
++ * Copyright (c) 2025 JARVISos Contributors
++ */
++#define pr_fmt(fmt) "jarvis-policy: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/list.h>
++#include <linux/string.h>
++#include <linux/uaccess.h>
++#include <linux/ratelimit.h>
++#include <linux/jiffies.h>
++#include <linux/sysfs.h>
++#include <linux/device.h>
++#include <linux/seq_buf.h>
++
++#include <uapi/linux/jarvis.h>
++#include "jarvis_policy.h"
++
++/* -----------------------------------------------------------------------
++ * Internal policy rule node
++ * --------------------------------------------------------------------- */
++
++struct policy_rule {
++	struct list_head   node;
++	char               pattern[JARVIS_POLICY_PATTERN_LEN]; /* "server:tool" */
++	char               path_prefix[JARVIS_PATH_LEN];       /* "" = any path */
++	enum jarvis_policy_tier tier;
++	u32                ratelimit_per_min;
++
++	/* Token-bucket state for per-rule rate limiting */
++	spinlock_t         rl_lock;
++	u32                rl_tokens;       /* current tokens available */
++	unsigned long      rl_last_refill;  /* jiffies of last refill   */
++};
++
++/* -----------------------------------------------------------------------
++ * Policy table
++ * --------------------------------------------------------------------- */
++
++static LIST_HEAD(policy_list);
++static DEFINE_RWLOCK(policy_lock);
++
++#define MAX_POLICY_RULES 128
++static unsigned int rule_count;
++
++/* -----------------------------------------------------------------------
++ * Built-in default policy rules
++ *
++ * Order matters: first match wins.
++ * path_prefix == NULL means "match any path" (same as "").
++ * Path rules are inserted first so they take priority over server:tool rules.
++ * --------------------------------------------------------------------- */
++static const struct {
++	const char *pattern;
++	enum jarvis_policy_tier tier;
++	u32 ratelimit_per_min;
++	const char *path_prefix; /* NULL = match any path */
++} jarvis_default_policy[] = {
++	/*
++	 * Path-based rules — FORBIDDEN writes to sensitive system directories.
++	 * These only fire when the daemon passes a non-empty path in
++	 * JARVIS_IOC_POLICY_CHECK.  They block ALL servers/tools that attempt
++	 * to write to critical directories, regardless of which MCP server is
++	 * making the request.
++	 */
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/etc"   },
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/usr"   },
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/boot"  },
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/sys"   },
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/proc"  },
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/sbin"  },
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/bin"   },
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/lib"   },
++	{ "*:*", JARVIS_TIER_FORBIDDEN, 0, "/lib64" },
++	/* Root's home is dangerous — require explicit confirmation */
++	{ "*:*", JARVIS_TIER_DANGEROUS, 0, "/root"  },
++
++	/*
++	 * Server:tool rules (path_prefix = NULL → match any path).
++	 */
++	/* File reads are safe */
++	{ "FileSystemMCP:read_file",       JARVIS_TIER_SAFE,      0,  NULL },
++	{ "FileSystemMCP:list_directory",  JARVIS_TIER_SAFE,      0,  NULL },
++	{ "FileSystemMCP:get_file_info",   JARVIS_TIER_SAFE,      0,  NULL },
++	/* File writes are elevated — audit logged */
++	{ "FileSystemMCP:write_file",      JARVIS_TIER_ELEVATED,  30, NULL },
++	{ "FileSystemMCP:create_directory",JARVIS_TIER_ELEVATED,  20, NULL },
++	/* File deletion is dangerous — needs user confirmation */
++	{ "FileSystemMCP:delete_file",     JARVIS_TIER_DANGEROUS, 5,  NULL },
++	{ "FileSystemMCP:delete_directory",JARVIS_TIER_DANGEROUS, 2,  NULL },
++	/* Any other filesystem op: elevated */
++	{ "FileSystemMCP:*",               JARVIS_TIER_ELEVATED,  20, NULL },
++	/* Shell: all commands require user confirmation */
++	{ "ShellMCP:run_command",          JARVIS_TIER_DANGEROUS, 20, NULL },
++	{ "ShellMCP:run_script",           JARVIS_TIER_DANGEROUS, 10, NULL },
++	{ "ShellMCP:approve_command",      JARVIS_TIER_ELEVATED,  0,  NULL },
++	{ "ShellMCP:deny_command",         JARVIS_TIER_ELEVATED,  0,  NULL },
++	{ "ShellMCP:*",                    JARVIS_TIER_DANGEROUS, 20, NULL },
++	/* Code generation / analysis: elevated */
++	{ "CodeGenMCP:*",                  JARVIS_TIER_ELEVATED,  0,  NULL },
++	{ "CodeAnalysisMCP:*",             JARVIS_TIER_ELEVATED,  0,  NULL },
++	/* Echo server: always safe (used for testing) */
++	{ "EchoMCP:*",                     JARVIS_TIER_SAFE,      0,  NULL },
++	/* Catch-all: anything unknown is elevated */
++	{ "*:*",                           JARVIS_TIER_ELEVATED,  60, NULL },
++};
++
++/* -----------------------------------------------------------------------
++ * Pattern matching — "server:tool" with per-field "*" wildcard
++ * --------------------------------------------------------------------- */
++
++static bool pattern_match(const char *pattern, const char *server, const char *tool)
++{
++	const char *sep = strchr(pattern, ':');
++	char pat_server[JARVIS_POLICY_PATTERN_LEN];
++	const char *pat_tool;
++	size_t slen;
++
++	if (!sep)
++		return false;
++
++	slen = sep - pattern;
++	if (slen >= JARVIS_POLICY_PATTERN_LEN)
++		return false;
++
++	memcpy(pat_server, pattern, slen);
++	pat_server[slen] = '\0';
++	pat_tool = sep + 1;
++
++	/* Match server field */
++	if (strcmp(pat_server, "*") != 0 && strcmp(pat_server, server) != 0)
++		return false;
++
++	/* Match tool field */
++	if (strcmp(pat_tool, "*") != 0 && strcmp(pat_tool, tool) != 0)
++		return false;
++
++	return true;
++}
++
++/* -----------------------------------------------------------------------
++ * Path prefix matching
++ *
++ * Returns true if @path falls under @prefix.
++ * An empty @prefix matches any path (rule applies regardless of path).
++ * An empty @path means no path was supplied; only prefix-less rules fire.
++ *
++ * "/etc"  matches "/etc" and "/etc/passwd" but NOT "/etcfoo".
++ * --------------------------------------------------------------------- */
++
++static bool path_match(const char *prefix, const char *path)
++{
++	size_t plen;
++
++	if (!prefix || !prefix[0])
++		return true;  /* empty prefix = match any path */
++
++	if (!path || !path[0])
++		return false; /* path not supplied, skip path-specific rules */
++
++	plen = strlen(prefix);
++	if (strncmp(path, prefix, plen) != 0)
++		return false;
++
++	/* prefix must end at a path boundary */
++	return path[plen] == '/' || path[plen] == '\0';
++}
++
++/* -----------------------------------------------------------------------
++ * Rate limiter (simple token bucket, no floating point)
++ * --------------------------------------------------------------------- */
++
++static bool ratelimit_check(struct policy_rule *rule)
++{
++	unsigned long now, elapsed;
++	u32 new_tokens;
++
++	if (rule->ratelimit_per_min == 0)
++		return true; /* unlimited */
++
++	spin_lock(&rule->rl_lock);
++
++	now     = jiffies;
++	elapsed = now - rule->rl_last_refill;
++
++	/* Refill: ratelimit_per_min tokens per 60 seconds */
++	if (elapsed >= 60 * HZ) {
++		rule->rl_tokens      = rule->ratelimit_per_min;
++		rule->rl_last_refill = now;
++	} else {
++		/* Partial refill proportional to elapsed time */
++		new_tokens = (u32)((u64)elapsed * rule->ratelimit_per_min / (60 * HZ));
++		rule->rl_tokens = min(rule->rl_tokens + new_tokens,
++				      rule->ratelimit_per_min);
++		if (new_tokens > 0)
++			rule->rl_last_refill = now;
++	}
++
++	if (rule->rl_tokens > 0) {
++		rule->rl_tokens--;
++		spin_unlock(&rule->rl_lock);
++		return true;
++	}
++
++	spin_unlock(&rule->rl_lock);
++	return false;
++}
++
++/* -----------------------------------------------------------------------
++ * Public API
++ * --------------------------------------------------------------------- */
++
++/**
++ * jarvis_policy_check - look up the policy tier for a server:tool action
++ * @server:   MCP server name
++ * @tool:     MCP tool name
++ * @path:     target filesystem path, or NULL/empty if not applicable
++ * @tier_out: filled with resolved tier
++ *
++ * Walks the policy table (first-match-wins).  A rule fires when both its
++ * server:tool pattern and its path_prefix match.  Rules with an empty
++ * path_prefix match regardless of @path.  Rules with a non-empty
++ * path_prefix only fire when @path is non-empty and starts with that prefix.
++ *
++ * Returns true if the action is allowed at the current rate, false if
++ * rate-limited or FORBIDDEN.
++ */
++bool jarvis_policy_check(const char *server, const char *tool, const char *path,
++			 enum jarvis_policy_tier *tier_out)
++{
++	struct policy_rule *rule;
++	bool allowed = false;
++
++	read_lock(&policy_lock);
++
++	list_for_each_entry(rule, &policy_list, node) {
++		if (!pattern_match(rule->pattern, server, tool))
++			continue;
++		if (!path_match(rule->path_prefix, path))
++			continue;
++
++		*tier_out = rule->tier;
++
++		if (rule->tier == JARVIS_TIER_FORBIDDEN) {
++			if (path && path[0])
++				pr_info("FORBIDDEN: %s:%s path=%s\n",
++					server, tool, path);
++			else
++				pr_info("FORBIDDEN: %s:%s\n", server, tool);
++			allowed = false;
++		} else {
++			allowed = ratelimit_check(rule);
++			if (!allowed)
++				pr_warn("rate-limited: %s:%s (tier=%u, limit=%u/min)\n",
++					server, tool, rule->tier,
++					rule->ratelimit_per_min);
++		}
++		goto out;
++	}
++
++	/* No rule matched — default to ELEVATED, allowed */
++	*tier_out = JARVIS_TIER_ELEVATED;
++	allowed   = true;
++
++out:
++	read_unlock(&policy_lock);
++	return allowed;
++}
++EXPORT_SYMBOL_GPL(jarvis_policy_check);
++
++/* -----------------------------------------------------------------------
++ * ioctl handlers — called from jarvis_core.c
++ * --------------------------------------------------------------------- */
++
++long jarvis_policy_ioctl(unsigned int cmd, void __user *uarg)
++{
++	switch (cmd) {
++
++	case JARVIS_IOC_POLICY_ADD: {
++		struct jarvis_policy_entry entry;
++		struct policy_rule *rule;
++
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		if (copy_from_user(&entry, uarg, sizeof(entry)))
++			return -EFAULT;
++		if (entry.tier > JARVIS_TIER_FORBIDDEN)
++			return -EINVAL;
++		entry.pattern[sizeof(entry.pattern) - 1] = '\0';
++		entry.path_prefix[sizeof(entry.path_prefix) - 1] = '\0';
++		if (!strchr(entry.pattern, ':'))
++			return -EINVAL;
++
++		write_lock(&policy_lock);
++		if (rule_count >= MAX_POLICY_RULES) {
++			write_unlock(&policy_lock);
++			return -ENOSPC;
++		}
++
++		rule = kzalloc(sizeof(*rule), GFP_ATOMIC);
++		if (!rule) {
++			write_unlock(&policy_lock);
++			return -ENOMEM;
++		}
++
++		strscpy(rule->pattern, entry.pattern, sizeof(rule->pattern));
++		strscpy(rule->path_prefix, entry.path_prefix,
++			sizeof(rule->path_prefix));
++		rule->tier              = entry.tier;
++		rule->ratelimit_per_min = entry.ratelimit_per_min;
++		spin_lock_init(&rule->rl_lock);
++		rule->rl_tokens      = entry.ratelimit_per_min;
++		rule->rl_last_refill = jiffies;
++
++		/* Insert at head (highest priority) */
++		list_add(&rule->node, &policy_list);
++		rule_count++;
++		write_unlock(&policy_lock);
++
++		pr_info("policy added: \"%s\" path=\"%s\" tier=%u rate=%u/min\n",
++			entry.pattern, entry.path_prefix,
++			entry.tier, entry.ratelimit_per_min);
++		return 0;
++	}
++
++	case JARVIS_IOC_POLICY_DEL: {
++		char pattern[JARVIS_POLICY_PATTERN_LEN] = {};
++		struct policy_rule *rule, *tmp;
++		bool found = false;
++
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		if (copy_from_user(pattern, uarg, sizeof(pattern) - 1))
++			return -EFAULT;
++
++		write_lock(&policy_lock);
++		list_for_each_entry_safe(rule, tmp, &policy_list, node) {
++			if (strncmp(rule->pattern, pattern,
++				    JARVIS_POLICY_PATTERN_LEN) == 0) {
++				list_del(&rule->node);
++				kfree(rule);
++				rule_count--;
++				found = true;
++				break;
++			}
++		}
++		write_unlock(&policy_lock);
++
++		return found ? 0 : -ENOENT;
++	}
++
++	case JARVIS_IOC_POLICY_CHECK: {
++		struct jarvis_policy_check check;
++		enum jarvis_policy_tier tier;
++		bool allowed;
++
++		if (copy_from_user(&check, uarg, sizeof(check)))
++			return -EFAULT;
++
++		check.server[sizeof(check.server) - 1] = '\0';
++		check.tool[sizeof(check.tool) - 1]     = '\0';
++		check.path[sizeof(check.path) - 1]     = '\0';
++
++		allowed       = jarvis_policy_check(check.server, check.tool,
++						    check.path, &tier);
++		check.tier    = tier;
++		check.allowed = allowed ? 1 : 0;
++
++		if (copy_to_user(uarg, &check, sizeof(check)))
++			return -EFAULT;
++		return 0;
++	}
++
++	case JARVIS_IOC_POLICY_RESET:
++		if (!capable(CAP_SYS_ADMIN))
++			return -EPERM;
++		return jarvis_policy_load_defaults();
++
++	default:
++		return -ENOTTY;
++	}
++}
++
++/* -----------------------------------------------------------------------
++ * Sysfs: read the current policy table
++ * --------------------------------------------------------------------- */
++
++static ssize_t policy_table_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct policy_rule *rule;
++	ssize_t len = 0;
++	static const char * const tier_names[] = {
++		"safe", "elevated", "dangerous", "forbidden"
++	};
++
++	read_lock(&policy_lock);
++	list_for_each_entry(rule, &policy_list, node) {
++		const char *tier_str = (rule->tier < ARRAY_SIZE(tier_names))
++					? tier_names[rule->tier] : "?";
++		const char *path_str = rule->path_prefix[0]
++					? rule->path_prefix : "*";
++		len += sysfs_emit_at(buf, len, "%-40s  %-12s  %-12s  %u/min\n",
++				     rule->pattern, tier_str, path_str,
++				     rule->ratelimit_per_min);
++		if (len >= PAGE_SIZE - 80)
++			break;
++	}
++	read_unlock(&policy_lock);
++
++	return len ?: sysfs_emit(buf, "(empty)\n");
++}
++static DEVICE_ATTR_RO(policy_table);
++
++static struct attribute *jarvis_policy_attrs[] = {
++	&dev_attr_policy_table.attr,
++	NULL,
++};
++
++static const struct attribute_group jarvis_policy_attr_group = {
++	.name  = "policy",
++	.attrs = jarvis_policy_attrs,
++};
++
++/* -----------------------------------------------------------------------
++ * Default rule loader
++ * --------------------------------------------------------------------- */
++
++int jarvis_policy_load_defaults(void)
++{
++	LIST_HEAD(defaults);
++	struct policy_rule *rule, *tmp;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(jarvis_default_policy); i++) {
++		rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++		if (!rule)
++			goto free_defaults;
++
++		strscpy(rule->pattern, jarvis_default_policy[i].pattern,
++			sizeof(rule->pattern));
++		if (jarvis_default_policy[i].path_prefix)
++			strscpy(rule->path_prefix,
++				jarvis_default_policy[i].path_prefix,
++				sizeof(rule->path_prefix));
++		rule->tier              = jarvis_default_policy[i].tier;
++		rule->ratelimit_per_min = jarvis_default_policy[i].ratelimit_per_min;
++		spin_lock_init(&rule->rl_lock);
++		rule->rl_tokens      = rule->ratelimit_per_min;
++		rule->rl_last_refill = jiffies;
++
++		list_add_tail(&rule->node, &defaults);
++	}
++
++	/* Publish a complete table; allocation failure preserves the old rules. */
++	write_lock(&policy_lock);
++	list_for_each_entry_safe(rule, tmp, &policy_list, node) {
++		list_del(&rule->node);
++		kfree(rule);
++	}
++	list_splice_init(&defaults, &policy_list);
++	rule_count = ARRAY_SIZE(jarvis_default_policy);
++	write_unlock(&policy_lock);
++	return 0;
++
++free_defaults:
++	list_for_each_entry_safe(rule, tmp, &defaults, node) {
++		list_del(&rule->node);
++		kfree(rule);
++	}
++	return -ENOMEM;
++}
++
++/* -----------------------------------------------------------------------
++ * Init / exit
++ * --------------------------------------------------------------------- */
++
++int jarvis_policy_init(struct device *parent_dev)
++{
++	int rc;
++
++	rc = jarvis_policy_load_defaults();
++	if (rc)
++		return rc;
++
++	rc = sysfs_create_group(&parent_dev->kobj, &jarvis_policy_attr_group);
++	if (rc)
++		pr_err("failed to create policy sysfs group: %d\n", rc);
++	else
++		pr_info("policy engine ready (%u rules)\n", rule_count);
++	return rc;
++}
++
++void jarvis_policy_exit(struct device *parent_dev)
++{
++	struct policy_rule *rule, *tmp;
++
++	sysfs_remove_group(&parent_dev->kobj, &jarvis_policy_attr_group);
++
++	write_lock(&policy_lock);
++	list_for_each_entry_safe(rule, tmp, &policy_list, node) {
++		list_del(&rule->node);
++		kfree(rule);
++	}
++	rule_count = 0;
++	write_unlock(&policy_lock);
++}
+diff --git a/drivers/jarvis/jarvis_policy.h b/drivers/jarvis/jarvis_policy.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_policy.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _JARVIS_POLICY_H
++#define _JARVIS_POLICY_H
++
++#include <linux/device.h>
++#include <uapi/linux/jarvis.h>
++
++#ifdef CONFIG_JARVIS_POLICY
++
++bool jarvis_policy_check(const char *server, const char *tool, const char *path,
++			 enum jarvis_policy_tier *tier_out);
++long jarvis_policy_ioctl(unsigned int cmd, void __user *uarg);
++int  jarvis_policy_load_defaults(void);
++int  jarvis_policy_init(struct device *parent_dev);
++void jarvis_policy_exit(struct device *parent_dev);
++
++#else
++
++static inline bool jarvis_policy_check(const char *server, const char *tool,
++					const char *path,
++					enum jarvis_policy_tier *tier_out)
++{
++	*tier_out = JARVIS_TIER_ELEVATED;
++	return true; /* permissive when policy module not built */
++}
++static inline long jarvis_policy_ioctl(unsigned int cmd, void __user *uarg)
++{
++	return -ENOTSUPP;
++}
++static inline int  jarvis_policy_load_defaults(void)      { return 0; }
++static inline int  jarvis_policy_init(struct device *d)   { return 0; }
++static inline void jarvis_policy_exit(struct device *d)   {}
++
++#endif /* CONFIG_JARVIS_POLICY */
++#endif /* _JARVIS_POLICY_H */
+diff --git a/drivers/jarvis/jarvis_sysmon.c b/drivers/jarvis/jarvis_sysmon.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_sysmon.c
+@@ -0,0 +1,223 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * JARVIS System Monitor sub-module
++ *
++ * Provides real-time hardware metrics to the AI daemon so it can make
++ * intelligent decisions about:
++ *
++ *   - Which LLM to run: if GPU VRAM is tight, use a smaller Ollama model or
++ *     fall back to the cloud API (Claude, OpenAI, etc.)
++ *   - Whether to throttle generation: if thermal_celsius > thermal_crit_c * 0.9
++ *     the daemon should pause or reduce batch size
++ *   - How much context the model can safely hold: bounded by mem_avail_mb
++ *
++ * Interface
++ * ---------
++ *   ioctl(fd, JARVIS_IOC_SYSMON, struct jarvis_sysmon *)  — one-shot snapshot
++ *   /sys/class/misc/jarvis/sysmon/ attrs                   — individual attrs
++ *     cpu_load   — CPU 1-min load average × 100
++ *     cpu_count  — online CPU count
++ *     mem_total  — total RAM MiB
++ *     mem_avail  — available RAM MiB
++ *     thermal    — "25 31 0 0 …" (temp per zone in °C, space-separated)
++ *     thermal_crit — highest critical trip-point in °C
++ *
++ * Copyright (c) 2025 JARVISos Contributors
++ */
++#define pr_fmt(fmt) "jarvis-sysmon: " fmt
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/sysfs.h>
++#include <linux/device.h>
++#include <linux/mm.h>
++#include <linux/sched/loadavg.h>
++#include <linux/cpumask.h>
++#include <linux/thermal.h>
++#include <linux/uaccess.h>
++#include <linux/seq_buf.h>
++
++#include <uapi/linux/jarvis.h>
++#include "jarvis_sysmon.h"
++
++/* -----------------------------------------------------------------------
++ * Core sampling helpers
++ * --------------------------------------------------------------------- */
++
++static void sample_cpu(struct jarvis_sysmon *s)
++{
++	/* avenrun[] is in fixed-point FSHIFT format; scale to ×100 */
++	s->cpu_load_1min = (avenrun[0] * 100) >> FSHIFT;
++	s->cpu_count     = num_online_cpus();
++}
++
++static void sample_memory(struct jarvis_sysmon *s)
++{
++	struct sysinfo si;
++	si_meminfo(&si);
++
++	/* si.mem_unit bytes per page unit */
++	s->mem_total_mb = ((u64)si.totalram * si.mem_unit) >> 20;
++	s->mem_free_mb  = ((u64)si.freeram  * si.mem_unit) >> 20;
++	s->swap_total_mb = ((u64)si.totalswap * si.mem_unit) >> 20;
++	s->swap_free_mb  = ((u64)si.freeswap  * si.mem_unit) >> 20;
++
++	/* mem_avail ≈ free + reclaimable page-cache (stable since 4.1) */
++	s->mem_avail_mb = (si_mem_available() * PAGE_SIZE) >> 20;
++}
++
++static void sample_thermal(struct jarvis_sysmon *s)
++{
++#ifdef CONFIG_THERMAL
++	/*
++	 * thermal_zone_get_zone_by_name() is the stable exported API for
++	 * looking up a registered zone by its type string. There is no
++	 * exported iterator for all zones from a module; probe well-known
++	 * x86 zone names instead. Zones not present return ERR_PTR(-ENODEV).
++	 */
++	static const char * const known_zones[] = {
++		"x86_pkg_temp", "acpitz", "k10temp", "coretemp",
++		"pch_skylake", "pch_cannonlake", "pch_cometlake",
++		"INT3400 Thermal", "B0D4", "B0D3",
++		NULL
++	};
++	struct thermal_zone_device *tz;
++	int idx = 0, i, temp, crit = 0;
++
++	s->thermal_count = 0;
++	memset(s->thermal_celsius, 0, sizeof(s->thermal_celsius));
++
++	for (i = 0; known_zones[i] && idx < JARVIS_THERMAL_MAX_ZONES; i++) {
++		tz = thermal_zone_get_zone_by_name(known_zones[i]);
++		if (IS_ERR_OR_NULL(tz))
++			continue;
++		if (thermal_zone_get_temp(tz, &temp))
++			continue;
++
++		s->thermal_celsius[idx++] = temp / 1000;
++
++		{
++			int crit_temp;
++			if (!thermal_zone_get_crit_temp(tz, &crit_temp) &&
++			    crit_temp / 1000 > crit)
++				crit = crit_temp / 1000;
++		}
++	}
++	s->thermal_count = idx;
++	s->thermal_crit_c = crit;
++#else
++	s->thermal_count  = 0;
++	s->thermal_crit_c = 0;
++#endif
++}
++
++/* -----------------------------------------------------------------------
++ * Public API — called from jarvis_core.c ioctl handler
++ * --------------------------------------------------------------------- */
++
++void jarvis_sysmon_sample(struct jarvis_sysmon *s)
++{
++	memset(s, 0, sizeof(*s));
++	sample_cpu(s);
++	sample_memory(s);
++	sample_thermal(s);
++}
++
++/* -----------------------------------------------------------------------
++ * Sysfs attribute group "sysmon" on the misc device
++ * --------------------------------------------------------------------- */
++
++static ssize_t cpu_load_show(struct device *dev,
++			     struct device_attribute *attr, char *buf)
++{
++	struct jarvis_sysmon s;
++	jarvis_sysmon_sample(&s);
++	return sysfs_emit(buf, "%u\n", s.cpu_load_1min);
++}
++static DEVICE_ATTR_RO(cpu_load);
++
++static ssize_t cpu_count_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", num_online_cpus());
++}
++static DEVICE_ATTR_RO(cpu_count);
++
++static ssize_t mem_total_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct jarvis_sysmon s;
++	jarvis_sysmon_sample(&s);
++	return sysfs_emit(buf, "%llu\n", s.mem_total_mb);
++}
++static DEVICE_ATTR_RO(mem_total);
++
++static ssize_t mem_avail_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct jarvis_sysmon s;
++	jarvis_sysmon_sample(&s);
++	return sysfs_emit(buf, "%llu\n", s.mem_avail_mb);
++}
++static DEVICE_ATTR_RO(mem_avail);
++
++static ssize_t thermal_show(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	struct jarvis_sysmon s;
++	ssize_t len = 0;
++	int i;
++
++	jarvis_sysmon_sample(&s);
++	for (i = 0; i < (int)s.thermal_count && i < JARVIS_THERMAL_MAX_ZONES; i++)
++		len += sysfs_emit_at(buf, len, "%d ", s.thermal_celsius[i]);
++	if (len > 0)
++		buf[len - 1] = '\n';
++	else
++		len = sysfs_emit(buf, "\n");
++	return len;
++}
++static DEVICE_ATTR_RO(thermal);
++
++static ssize_t thermal_crit_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct jarvis_sysmon s;
++	jarvis_sysmon_sample(&s);
++	return sysfs_emit(buf, "%d\n", s.thermal_crit_c);
++}
++static DEVICE_ATTR_RO(thermal_crit);
++
++static struct attribute *jarvis_sysmon_attrs[] = {
++	&dev_attr_cpu_load.attr,
++	&dev_attr_cpu_count.attr,
++	&dev_attr_mem_total.attr,
++	&dev_attr_mem_avail.attr,
++	&dev_attr_thermal.attr,
++	&dev_attr_thermal_crit.attr,
++	NULL,
++};
++
++static const struct attribute_group jarvis_sysmon_attr_group = {
++	.name  = "sysmon",
++	.attrs = jarvis_sysmon_attrs,
++};
++
++/* -----------------------------------------------------------------------
++ * Init / exit — called from jarvis_core
++ * --------------------------------------------------------------------- */
++
++int jarvis_sysmon_init(struct device *parent_dev)
++{
++	int rc = sysfs_create_group(&parent_dev->kobj, &jarvis_sysmon_attr_group);
++	if (rc)
++		pr_err("failed to create sysmon sysfs group: %d\n", rc);
++	else
++		pr_info("sysmon ready (cpu/memory/thermal metrics available)\n");
++	return rc;
++}
++
++void jarvis_sysmon_exit(struct device *parent_dev)
++{
++	sysfs_remove_group(&parent_dev->kobj, &jarvis_sysmon_attr_group);
++}
+diff --git a/drivers/jarvis/jarvis_sysmon.h b/drivers/jarvis/jarvis_sysmon.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/jarvis/jarvis_sysmon.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _JARVIS_SYSMON_H
++#define _JARVIS_SYSMON_H
++
++#include <linux/device.h>
++#include <uapi/linux/jarvis.h>
++
++#ifdef CONFIG_JARVIS_SYSMON
++
++void jarvis_sysmon_sample(struct jarvis_sysmon *s);
++int  jarvis_sysmon_init(struct device *parent_dev);
++void jarvis_sysmon_exit(struct device *parent_dev);
++
++#else
++
++static inline void jarvis_sysmon_sample(struct jarvis_sysmon *s)
++{
++	memset(s, 0, sizeof(*s));
++}
++static inline int  jarvis_sysmon_init(struct device *d) { return 0; }
++static inline void jarvis_sysmon_exit(struct device *d) {}
++
++#endif /* CONFIG_JARVIS_SYSMON */
++#endif /* _JARVIS_SYSMON_H */
+diff --git a/include/linux/jarvis.h b/include/linux/jarvis.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/jarvis.h
+@@ -0,0 +1,65 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * linux/jarvis.h — in-kernel API for the JARVIS AI integration driver
++ *
++ * Other kernel subsystems (thermal, OOM, audit, etc.) use these to submit
++ * natural-language events to the JARVIS daemon via jarvis_post_query() and
++ * to gate tool execution via jarvis_policy_check().
++ *
++ * IS_ENABLED() is used throughout so stubs are provided for both =n and the
++ * caller-side of =m (the module itself sees declarations, not stubs).
++ *
++ * Userspace API is in <uapi/linux/jarvis.h>.
++ */
++#ifndef _LINUX_JARVIS_H
++#define _LINUX_JARVIS_H
++
++#include <linux/kconfig.h>
++#include <uapi/linux/jarvis.h>
++
++#if IS_ENABLED(CONFIG_JARVIS)
++
++int jarvis_post_query(enum jarvis_query_type type, const void *data, u32 len);
++int jarvis_query_sync(enum jarvis_query_type type, const void *data, u32 len,
++		      struct jarvis_response *resp, unsigned long timeout);
++
++#else /* CONFIG_JARVIS not set */
++
++static inline int jarvis_post_query(enum jarvis_query_type type,
++				    const void *data, u32 len)
++{ return -ENODEV; }
++
++static inline int jarvis_query_sync(enum jarvis_query_type type,
++				    const void *data, u32 len,
++				    struct jarvis_response *resp,
++				    unsigned long timeout)
++{ return -ENODEV; }
++
++#endif /* IS_ENABLED(CONFIG_JARVIS) */
++
++#if IS_ENABLED(CONFIG_JARVIS_POLICY)
++
++bool jarvis_policy_check(const char *server, const char *tool, const char *path,
++			 enum jarvis_policy_tier *tier_out);
++
++#else
++
++static inline bool jarvis_policy_check(const char *server, const char *tool,
++				       const char *path,
++				       enum jarvis_policy_tier *tier_out)
++{ return true; }
++
++#endif /* IS_ENABLED(CONFIG_JARVIS_POLICY) */
++
++#if IS_ENABLED(CONFIG_JARVIS_KEYS)
++
++int jarvis_key_lookup(const char *id, char *buf, size_t buflen);
++
++#else
++
++static inline int jarvis_key_lookup(const char *id, char *buf, size_t buflen)
++{ return -ENODEV; }
++
++#endif /* IS_ENABLED(CONFIG_JARVIS_KEYS) */
++
++#endif /* _LINUX_JARVIS_H */
+diff --git a/include/uapi/linux/jarvis.h b/include/uapi/linux/jarvis.h
+new file mode 100644
+--- /dev/null
++++ b/include/uapi/linux/jarvis.h
+@@ -0,0 +1,306 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * JARVIS AI Kernel Integration Driver - Userspace API
++ *
++ * linux-jarvisos: custom Linux kernel with native AI assistant integration.
++ * This header defines the complete interface between the JARVIS daemon and
++ * all kernel driver sub-modules:
++ *
++ *   jarvis_core    — query/response channel  (/dev/jarvis)
++ *   jarvis_dibs    — zero-copy DIBS buffers
++ *   jarvis_sysmon  — live hardware metrics for model selection
++ *   jarvis_policy  — AI action security policy engine
++ *   jarvis_keys    — secure API-key storage via kernel keyring
++ *
++ * Message flow:
++ *   Kernel → AI : enqueue jarvis_query via jarvis_post_query()
++ *   AI reads    : read() on /dev/jarvis, one jarvis_query per call
++ *   AI replies  : JARVIS_IOC_RESPOND ioctl
++ *   AI polls    : poll()/select() for POLLIN when queue non-empty
++ *
++ * LLM provider model:
++ *   Local  — Ollama daemon, model chosen based on JARVIS_IOC_SYSMON hardware caps
++ *   Cloud  — Claude, OpenAI, etc.; API keys stored via JARVIS_IOC_KEY_STORE
++ */
++#ifndef _UAPI_LINUX_JARVIS_H
++#define _UAPI_LINUX_JARVIS_H
++
++#include <linux/types.h>
++#include <linux/ioctl.h>
++
++/* -----------------------------------------------------------------------
++ * Common constants
++ * --------------------------------------------------------------------- */
++
++#define JARVIS_MAX_QUERY_LEN     4096   /* max query payload bytes             */
++#define JARVIS_MAX_RESP_LEN      65536  /* max response payload bytes          */
++#define JARVIS_MODEL_NAME_LEN    64     /* max model name / provider string    */
++#define JARVIS_KEY_ID_LEN        64     /* max key description length          */
++#define JARVIS_KEY_DATA_LEN      512    /* max key value length (API keys)     */
++#define JARVIS_POLICY_PATTERN_LEN 128   /* max server:tool pattern length      */
++#define JARVIS_PATH_LEN          256    /* max filesystem path in policy rules */
++#define JARVIS_THERMAL_MAX_ZONES 16     /* max thermal zones reported          */
++
++/* -----------------------------------------------------------------------
++ * Query types
++ * --------------------------------------------------------------------- */
++enum jarvis_query_type {
++	JARVIS_QTYPE_GENERIC    = 0,   /* free-form natural-language query        */
++	JARVIS_QTYPE_SYSEVT     = 1,   /* kernel system event (thermal, OOM …)    */
++	JARVIS_QTYPE_AUDIT      = 2,   /* security/audit event for AI analysis    */
++	JARVIS_QTYPE_DIAG       = 3,   /* hardware/driver diagnostic request      */
++	JARVIS_QTYPE_VOICE_CMD  = 4,   /* voice command payload from voice driver */
++	JARVIS_QTYPE_MCP_CALL   = 5,   /* direct MCP tool-call forwarded to AI    */
++	JARVIS_QTYPE_POLICY_REQ = 6,   /* policy authorisation request            */
++};
++
++/* -----------------------------------------------------------------------
++ * AI agent state
++ * --------------------------------------------------------------------- */
++enum jarvis_state {
++	JARVIS_STATE_OFFLINE    = 0,   /* daemon not connected                    */
++	JARVIS_STATE_IDLE       = 1,   /* connected, ready                        */
++	JARVIS_STATE_PROCESSING = 2,   /* running inference                       */
++	JARVIS_STATE_ERROR      = 3,   /* daemon fatal error                      */
++};
++
++/* -----------------------------------------------------------------------
++ * LLM provider type — reported by daemon via JARVIS_IOC_SET_PROVIDER
++ * --------------------------------------------------------------------- */
++enum jarvis_provider {
++	JARVIS_PROVIDER_NONE    = 0,   /* not yet configured                      */
++	JARVIS_PROVIDER_OLLAMA  = 1,   /* local Ollama (llama3, mistral, etc.)    */
++	JARVIS_PROVIDER_CLAUDE  = 2,   /* Anthropic Claude API                    */
++	JARVIS_PROVIDER_OPENAI  = 3,   /* OpenAI / ChatGPT API                    */
++	JARVIS_PROVIDER_OPENAI_COMPAT = 4, /* OpenAI-compatible endpoint          */
++};
++
++/* -----------------------------------------------------------------------
++ * Policy action tiers
++ * --------------------------------------------------------------------- */
++enum jarvis_policy_tier {
++	JARVIS_TIER_SAFE      = 0,   /* always allowed, no confirmation needed    */
++	JARVIS_TIER_ELEVATED  = 1,   /* allowed with audit log entry              */
++	JARVIS_TIER_DANGEROUS = 2,   /* requires explicit user confirmation       */
++	JARVIS_TIER_FORBIDDEN = 3,   /* never allowed, kernel will block          */
++};
++
++/* -----------------------------------------------------------------------
++ * Core structures
++ * --------------------------------------------------------------------- */
++
++/**
++ * struct jarvis_query - kernel → AI message
++ * @id:        monotonic query id (assigned by driver)
++ * @type:      jarvis_query_type
++ * @flags:     reserved, zero
++ * @len:       valid bytes in @data
++ * @timestamp: ktime_get_ns() at creation
++ * @data:      NUL-terminated string or binary blob
++ */
++struct jarvis_query {
++	__u64 id;
++	__u32 type;
++	__u32 flags;
++	__u32 len;
++	__u32 __pad;
++	__u64 timestamp;
++	__u8  data[JARVIS_MAX_QUERY_LEN];
++};
++
++/**
++ * struct jarvis_response - AI → kernel reply
++ * @id:     matching jarvis_query.id
++ * @status: 0 = OK, non-zero = AI-level error
++ * @flags:  reserved, zero
++ * @len:    valid bytes in @data
++ * @data:   response payload
++ */
++struct jarvis_response {
++	__u64 id;
++	__u32 status;
++	__u32 flags;
++	__u32 len;
++	__u32 __pad;
++	__u8  data[JARVIS_MAX_RESP_LEN];
++};
++
++/**
++ * struct jarvis_status - driver + daemon snapshot
++ * @state:           jarvis_state of the connected daemon
++ * @provider:        jarvis_provider currently active
++ * @pending_queries: queries waiting in the ring buffer
++ * @model_loaded:    1 if model is ready, 0 otherwise
++ * @model_name:      NUL-terminated active model name
++ * @provider_name:   NUL-terminated provider string (e.g. "ollama", "claude")
++ */
++struct jarvis_status {
++	__u32 state;
++	__u32 provider;
++	__u32 pending_queries;
++	__u32 model_loaded;
++	__u8  model_name[JARVIS_MODEL_NAME_LEN];
++	__u8  provider_name[JARVIS_MODEL_NAME_LEN];
++};
++
++/**
++ * struct jarvis_dibs_reg - DIBS Direct Memory Buffer registration
++ * @dmb_tok:  DIBS fabric token
++ * @dmb_len:  buffer length in bytes
++ * @slot:     output — slot index assigned by driver
++ */
++struct jarvis_dibs_reg {
++	__u64 dmb_tok;
++	__u32 dmb_len;
++	__u32 slot;
++};
++
++/* -----------------------------------------------------------------------
++ * System monitor structure (jarvis_sysmon sub-module)
++ * --------------------------------------------------------------------- */
++
++/**
++ * struct jarvis_sysmon - live hardware snapshot for model/task selection
++ *
++ * Used by the AI daemon to decide:
++ *   - Whether to use Ollama (local) vs cloud API
++ *   - Which Ollama model fits available VRAM / RAM
++ *   - Whether to throttle requests under thermal pressure
++ *
++ * @cpu_load_1min:   CPU load average × 100 (e.g. 125 = 1.25)
++ * @cpu_count:       online CPU count
++ * @mem_total_mb:    total RAM in MiB
++ * @mem_free_mb:     free RAM in MiB
++ * @mem_avail_mb:    available RAM (free + reclaimable) in MiB
++ * @thermal_count:   number of valid entries in @thermal_celsius
++ * @thermal_celsius: temperature of each thermal zone in °C (integer)
++ * @thermal_crit_c:  critical trip-point of the hottest zone (0 = unknown)
++ * @swap_total_mb:   total swap space in MiB
++ * @swap_free_mb:    free swap space in MiB
++ */
++struct jarvis_sysmon {
++	__u32 cpu_load_1min;
++	__u32 cpu_count;
++	__u64 mem_total_mb;
++	__u64 mem_free_mb;
++	__u64 mem_avail_mb;
++	__u32 thermal_count;
++	__s32 thermal_celsius[JARVIS_THERMAL_MAX_ZONES];
++	__s32 thermal_crit_c;
++	__u64 swap_total_mb;
++	__u64 swap_free_mb;
++};
++
++/* -----------------------------------------------------------------------
++ * Policy structures (jarvis_policy sub-module)
++ * --------------------------------------------------------------------- */
++
++/**
++ * struct jarvis_policy_entry - one policy rule
++ * @pattern:     "server:tool" glob pattern (e.g. "ShellMCP:*", "*:delete_file")
++ *               Use "*" to match anything in that field.
++ * @tier:        jarvis_policy_tier for matching actions
++ * @ratelimit_per_min: max allowed calls/minute (0 = unlimited)
++ * @path_prefix: optional filesystem path prefix this rule applies to
++ *               (e.g. "/etc", "/boot").  Empty string means any path.
++ *               Prefix "/etc" matches "/etc" and "/etc/..." but not "/etcfoo".
++ */
++struct jarvis_policy_entry {
++	__u8  pattern[JARVIS_POLICY_PATTERN_LEN];
++	__u32 tier;
++	__u32 ratelimit_per_min;
++	__u8  path_prefix[JARVIS_PATH_LEN];
++};
++
++/**
++ * struct jarvis_policy_check - policy check request / result
++ * @server:  server name of the action being checked (input)
++ * @tool:    tool name of the action being checked (input)
++ * @path:    target filesystem path of the action, or empty (input)
++ *           When non-empty, path-prefix rules are evaluated in addition
++ *           to server:tool pattern rules.  Path-prefix rules take priority
++ *           (first-match-wins in insertion order).
++ * @tier:    resolved tier (output, filled by driver)
++ * @allowed: 1 if allowed at current rate, 0 if blocked (output)
++ */
++struct jarvis_policy_check {
++	__u8  server[JARVIS_POLICY_PATTERN_LEN];
++	__u8  tool[JARVIS_POLICY_PATTERN_LEN];
++	__u8  path[JARVIS_PATH_LEN];
++	__u32 tier;
++	__u32 allowed;
++};
++
++/* -----------------------------------------------------------------------
++ * Key structures (jarvis_keys sub-module)
++ * --------------------------------------------------------------------- */
++
++/**
++ * struct jarvis_key_op - store or retrieve an API key
++ * @id:    NUL-terminated key identifier (e.g. "claude-api-key")
++ * @data:  key value (for STORE: plaintext; for GET: filled by driver)
++ * @len:   on GET: filled by driver with actual key length
++ */
++struct jarvis_key_op {
++	__u8  id[JARVIS_KEY_ID_LEN];
++	__u8  data[JARVIS_KEY_DATA_LEN];
++	__u32 len;
++	__u32 __pad;
++};
++
++/**
++ * struct jarvis_respond_ioc - ioctl argument for JARVIS_IOC_RESPOND
++ *
++ * struct jarvis_response exceeds the 14-bit ioctl size field (16383 bytes
++ * max), so the response payload is passed by user pointer instead.
++ *
++ * @id:       matching jarvis_query.id
++ * @status:   0 = OK, non-zero = AI error
++ * @flags:    reserved, zero
++ * @len:      bytes at *data_ptr (must be ≤ JARVIS_MAX_RESP_LEN)
++ * @data_ptr: user pointer to response payload buffer
++ */
++struct jarvis_respond_ioc {
++	__u64 id;
++	__u32 status;
++	__u32 flags;
++	__u32 len;
++	__u32 __pad;
++	__u64 data_ptr;
++};
++
++/* -----------------------------------------------------------------------
++ * ioctl command table
++ *
++ * Numbers 1–9   : core (query/response/state/model/DIBS/flush)
++ * Numbers 10–15 : sysmon
++ * Numbers 20–29 : policy
++ * Numbers 30–39 : keys
++ * --------------------------------------------------------------------- */
++#define JARVIS_IOC_MAGIC         'J'
++
++/* --- Core --- */
++#define JARVIS_IOC_STATUS        _IOR(JARVIS_IOC_MAGIC,  1, struct jarvis_status)
++#define JARVIS_IOC_SET_STATE     _IOW(JARVIS_IOC_MAGIC,  2, __u32)
++#define JARVIS_IOC_SET_MODEL     _IOW(JARVIS_IOC_MAGIC,  3, char[JARVIS_MODEL_NAME_LEN])
++#define JARVIS_IOC_RESPOND       _IOW(JARVIS_IOC_MAGIC,  4, struct jarvis_respond_ioc)
++#define JARVIS_IOC_DIBS_REG      _IOWR(JARVIS_IOC_MAGIC, 5, struct jarvis_dibs_reg)
++#define JARVIS_IOC_DIBS_UNREG    _IOW(JARVIS_IOC_MAGIC,  6, __u32)
++#define JARVIS_IOC_FLUSH         _IO(JARVIS_IOC_MAGIC,   7)
++#define JARVIS_IOC_SET_PROVIDER  _IOW(JARVIS_IOC_MAGIC,  8, __u32)
++
++/* --- Sysmon --- */
++#define JARVIS_IOC_SYSMON        _IOR(JARVIS_IOC_MAGIC, 10, struct jarvis_sysmon)
++
++/* --- Policy --- */
++#define JARVIS_IOC_POLICY_ADD    _IOW(JARVIS_IOC_MAGIC,  20, struct jarvis_policy_entry)
++#define JARVIS_IOC_POLICY_DEL    _IOW(JARVIS_IOC_MAGIC,  21, __u8[JARVIS_POLICY_PATTERN_LEN])
++#define JARVIS_IOC_POLICY_CHECK  _IOWR(JARVIS_IOC_MAGIC, 22, struct jarvis_policy_check)
++#define JARVIS_IOC_POLICY_RESET  _IO(JARVIS_IOC_MAGIC,   23)
++
++/* --- Keys --- */
++#define JARVIS_IOC_KEY_STORE     _IOW(JARVIS_IOC_MAGIC,  30, struct jarvis_key_op)
++#define JARVIS_IOC_KEY_GET       _IOWR(JARVIS_IOC_MAGIC, 31, struct jarvis_key_op)
++#define JARVIS_IOC_KEY_DEL       _IOW(JARVIS_IOC_MAGIC,  32, __u8[JARVIS_KEY_ID_LEN])
++
++#endif /* _UAPI_LINUX_JARVIS_H */
